@@ -7,16 +7,16 @@ from datetime import datetime
 from pathlib import Path
 import telebot
 from groq import Groq
-import google.generativeai as genai
+from google import genai as google_genai
 
 # ──────────────────────────────────────────────
 # KONFIGURATSIYA — Railway Variables'dan olinadi
 # ──────────────────────────────────────────────
-BOT_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+BOT_TOKEN      = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
-PROJECT_ROOT  = Path(__file__).parent.resolve()
+PROJECT_ROOT   = Path(__file__).parent.resolve()
 OBSIDIAN_VAULT = PROJECT_ROOT / "content" / "Agent_Logs"
 OBSIDIAN_VAULT.mkdir(parents=True, exist_ok=True)
 
@@ -24,18 +24,30 @@ GROQ_CONTEXT_LIMIT = 4000
 GROQ_MODEL    = "llama3-70b-8192"
 GEMINI_MODEL  = "gemini-2.5-flash"
 
+# ──────────────────────────────────────────────
+# BOT YARATISH + WEBHOOK O'CHIRISH
+# ──────────────────────────────────────────────
 bot = telebot.TeleBot(BOT_TOKEN)
+
+def init_bot():
+    """Ishga tushishdan oldin eski webhook va conflict'larni tozalaydi"""
+    try:
+        bot.delete_webhook(drop_pending_updates=True)
+        print("✅ Webhook o'chirildi, polling rejimiga o'tildi.")
+        time.sleep(2)  # Railway eski instanceni to'liq o'chirishi uchun kutamiz
+    except Exception as e:
+        print(f"[WEBHOOK] {e}")
 
 # ──────────────────────────────────────────────
 # GIT: GitHub'ga avtomatik push
 # ──────────────────────────────────────────────
 def git_push_changes(commit_message: str) -> bool:
     try:
-        subprocess.run(["git", "config", "--global", "user.name",  "AI-Agent"],      check=True)
-        subprocess.run(["git", "config", "--global", "user.email", "agent@ai.com"],   check=True)
-        subprocess.run(["git", "add", "."],                                            check=True)
-        subprocess.run(["git", "commit", "-m", commit_message],                        check=True)
-        subprocess.run(["git", "push", "origin", "main"],                              check=True)
+        subprocess.run(["git", "config", "--global", "user.name",  "AI-Agent"],    check=True)
+        subprocess.run(["git", "config", "--global", "user.email", "agent@ai.com"], check=True)
+        subprocess.run(["git", "add", "."],                                          check=True)
+        subprocess.run(["git", "commit", "-m", commit_message],                      check=True)
+        subprocess.run(["git", "push", "origin", "main"],                            check=True)
         return True
     except Exception as e:
         print(f"[GIT XATO] {e}")
@@ -60,17 +72,15 @@ def get_past_knowledge() -> str:
 
 # ──────────────────────────────────────────────
 # AI ROUTER — Groq (qisqa) / Gemini (uzun)
+# YANGI: google.genai paketi ishlatiladi
 # ──────────────────────────────────────────────
 def _parse_response(raw: str) -> tuple[str, str]:
-    """<thinking> bloki va asosiy javobni ajratadi"""
     raw = raw.strip()
     thinking = ""
     match = re.search(r"<thinking>(.*?)</thinking>", raw, re.DOTALL)
     if match:
         thinking = match.group(1).strip()
         raw = re.sub(r"<thinking>.*?</thinking>", "", raw, flags=re.DOTALL).strip()
-
-    # Kod bloki bo'lsa, toza kodni ajrat
     if "```" in raw:
         for part in raw.split("```"):
             stripped = part.strip().lstrip("python").strip()
@@ -88,14 +98,18 @@ def ask_ai(prompt: str) -> tuple[str, str, str]:
 
     try:
         if len(full) > GROQ_CONTEXT_LIMIT:
-            genai.configure(api_key=GEMINI_API_KEY)
-            model = genai.GenerativeModel(GEMINI_MODEL)
-            text  = model.generate_content(full).text or ""
-            t, c  = _parse_response(text)
+            # YANGI google.genai paketi
+            client = google_genai.Client(api_key=GEMINI_API_KEY)
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=full
+            )
+            text = response.text or ""
+            t, c = _parse_response(text)
             return GEMINI_MODEL, t, c
         else:
             client = Groq(api_key=GROQ_API_KEY)
-            resp   = client.chat.completions.create(
+            resp = client.chat.completions.create(
                 model=GROQ_MODEL,
                 messages=[{"role": "user", "content": full}],
                 temperature=0.2,
@@ -117,11 +131,9 @@ def extract_and_save_knowledge(user_msg: str, ai_reply: str):
         f"Foydalanuvchi: {user_msg}\nAI: {ai_reply}"
     )
     _, _, decision = ask_ai(prompt)
-
     if "SKIP" in decision.upper():
         return
-
-    ts        = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     note_path = OBSIDIAN_VAULT / f"learned_{ts}.md"
     note_path.write_text(
         f"""---
@@ -173,13 +185,10 @@ def handle_message(message):
 
     model, thinking, reply = ask_ai(prompt)
 
-    # Thinking bo'lsa, faqat konsolga chiqarish (Telegram'ga emas)
     if thinking:
         print(f"[THINKING — {model}]\n{thinking}\n")
 
     bot.reply_to(message, reply or "❌ AI javob qaytarmadi.")
-
-    # Orqa fonda bilim saqlaymiz
     extract_and_save_knowledge(user_text, reply)
 
 # ──────────────────────────────────────────────
@@ -187,7 +196,8 @@ def handle_message(message):
 # ──────────────────────────────────────────────
 if __name__ == "__main__":
     if not BOT_TOKEN:
-        print("[XATO] TELEGRAM_BOT_TOKEN topilmadi! Railway Variables'ga qo'shing.")
+        print("[XATO] TELEGRAM_BOT_TOKEN topilmadi!")
         sys.exit(1)
+    init_bot()  # Webhook o'chiradi va conflict'ni hal qiladi
     print("🤖 Bot muvaffaqiyatli ishga tushdi...")
-    bot.infinity_polling()
+    bot.infinity_polling(allowed_updates=telebot.util.update_types)
